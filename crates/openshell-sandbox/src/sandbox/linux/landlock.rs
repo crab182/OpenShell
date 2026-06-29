@@ -280,4 +280,85 @@ mod tests {
         let err = PathFd::new("/nonexistent/openshell/classify/test").unwrap_err();
         assert_eq!(classify_path_fd_error(&err), "path does not exist");
     }
+
+    #[test]
+    fn classify_path_fd_error_extracts_not_a_directory() {
+        // Opening a path *beneath* a regular file yields ENOTDIR from open(2).
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("regular_file");
+        std::fs::write(&file_path, b"x").unwrap();
+        let beneath = file_path.join("child");
+        let err = PathFd::new(&beneath).unwrap_err();
+        assert_eq!(
+            classify_path_fd_error(&err),
+            "path component is not a directory"
+        );
+    }
+
+    #[test]
+    fn classify_io_error_falls_back_for_kind_without_raw_errno() {
+        // An error constructed without a raw OS errno (only an ErrorKind) that
+        // is not NotFound / PermissionDenied must take the `raw_os_error() ==
+        // None` branch and resolve to the generic reason.
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "synthetic");
+        assert_eq!(classify_io_error(&err), "unexpected error");
+    }
+
+    #[test]
+    fn classify_io_error_unhandled_errno_is_unexpected() {
+        // EISDIR is a real errno but not one of the specifically classified
+        // values, so it must fall through to the generic reason rather than
+        // being mislabelled.
+        let err = std::io::Error::from_raw_os_error(libc::EISDIR);
+        assert_eq!(classify_io_error(&err), "unexpected error");
+    }
+
+    #[test]
+    fn compat_level_best_effort_maps_to_best_effort() {
+        assert_eq!(
+            compat_level(&LandlockCompatibility::BestEffort),
+            CompatLevel::BestEffort
+        );
+    }
+
+    #[test]
+    fn compat_level_hard_requirement_maps_to_hard_requirement() {
+        assert_eq!(
+            compat_level(&LandlockCompatibility::HardRequirement),
+            CompatLevel::HardRequirement
+        );
+    }
+
+    #[test]
+    fn try_open_path_succeeds_for_existing_file() {
+        // A regular file (not just a directory) is a valid Landlock path target.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("allowed_file");
+        std::fs::write(&file_path, b"data").unwrap();
+        let result = try_open_path(&file_path, &LandlockCompatibility::BestEffort);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn try_open_path_hard_requirement_succeeds_for_existing_path() {
+        // Hard-requirement mode must still open paths that exist; failure is
+        // only fatal when the path is genuinely inaccessible.
+        let dir = tempfile::tempdir().unwrap();
+        let result = try_open_path(dir.path(), &LandlockCompatibility::HardRequirement);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn try_open_path_hard_requirement_error_includes_path() {
+        let missing = PathBuf::from("/nonexistent/openshell/hard/req/path");
+        let err = try_open_path(&missing, &LandlockCompatibility::HardRequirement)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("/nonexistent/openshell/hard/req/path"),
+            "error should name the offending path: {err}"
+        );
+    }
 }
