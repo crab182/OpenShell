@@ -164,3 +164,170 @@ impl From<ProtoProcessPolicy> for ProcessPolicy {
         }
     }
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A proto policy with only `version` set; every sub-policy is absent so we
+    /// exercise the `unwrap_or_default()` branches.
+    fn empty_proto(version: u32) -> ProtoSandboxPolicy {
+        ProtoSandboxPolicy {
+            version,
+            ..Default::default()
+        }
+    }
+
+    // ------------------------------------------------------------------ network
+
+    /// Security invariant: in cluster mode the sandbox MUST always run with
+    /// proxy networking so that every egress is evaluated by OPA. The proto's
+    /// own network field is intentionally ignored — this test pins that
+    /// behaviour so a future refactor can't silently let `Allow`/`Block` mode
+    /// (i.e. unproxied egress) leak through.
+    #[test]
+    fn conversion_always_forces_proxy_networking() {
+        let policy = SandboxPolicy::try_from(empty_proto(1)).unwrap();
+        assert!(
+            matches!(policy.network.mode, NetworkMode::Proxy),
+            "expected egress to be forced through the proxy, got {:?}",
+            policy.network.mode
+        );
+        // Proxy is present but the address is resolved later (None here), never
+        // pre-bound to an attacker-controlled value from the proto.
+        let proxy = policy.network.proxy.expect("proxy policy must be present");
+        assert!(proxy.http_addr.is_none());
+    }
+
+    #[test]
+    fn version_is_preserved() {
+        let policy = SandboxPolicy::try_from(empty_proto(7)).unwrap();
+        assert_eq!(policy.version, 7);
+    }
+
+    // --------------------------------------------------------------- filesystem
+
+    #[test]
+    fn absent_filesystem_uses_secure_defaults() {
+        let policy = SandboxPolicy::try_from(empty_proto(1)).unwrap();
+        assert!(policy.filesystem.read_only.is_empty());
+        assert!(policy.filesystem.read_write.is_empty());
+        // Default keeps the workdir writable; everything else is denied.
+        assert!(policy.filesystem.include_workdir);
+    }
+
+    #[test]
+    fn filesystem_paths_are_normalized_and_flags_preserved() {
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFilesystemPolicy {
+                read_only: vec!["/data//foo/".to_string(), "/a/./b".to_string()],
+                read_write: vec!["/work/".to_string()],
+                include_workdir: false,
+            }),
+            ..Default::default()
+        };
+
+        let policy = SandboxPolicy::try_from(proto).unwrap();
+
+        // Redundant separators, trailing slashes, and `.` components collapse so
+        // that allow-list matching can't be defeated by path aliasing.
+        assert_eq!(
+            policy.filesystem.read_only,
+            vec![PathBuf::from("/data/foo"), PathBuf::from("/a/b")],
+        );
+        assert_eq!(policy.filesystem.read_write, vec![PathBuf::from("/work")]);
+        assert!(!policy.filesystem.include_workdir);
+    }
+
+    // ------------------------------------------------------------------ landlock
+
+    #[test]
+    fn landlock_hard_requirement_is_honoured() {
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            landlock: Some(ProtoLandlockPolicy {
+                compatibility: "hard_requirement".to_string(),
+            }),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::try_from(proto).unwrap();
+        assert!(matches!(
+            policy.landlock.compatibility,
+            LandlockCompatibility::HardRequirement
+        ));
+    }
+
+    #[test]
+    fn landlock_unknown_or_empty_value_falls_back_to_best_effort() {
+        for value in ["best_effort", "", "HARD_REQUIREMENT", "garbage"] {
+            let proto = ProtoSandboxPolicy {
+                version: 1,
+                landlock: Some(ProtoLandlockPolicy {
+                    compatibility: value.to_string(),
+                }),
+                ..Default::default()
+            };
+            let policy = SandboxPolicy::try_from(proto).unwrap();
+            assert!(
+                matches!(
+                    policy.landlock.compatibility,
+                    LandlockCompatibility::BestEffort
+                ),
+                "value {value:?} should map to BestEffort",
+            );
+        }
+    }
+
+    #[test]
+    fn absent_landlock_defaults_to_best_effort() {
+        let policy = SandboxPolicy::try_from(empty_proto(1)).unwrap();
+        assert!(matches!(
+            policy.landlock.compatibility,
+            LandlockCompatibility::BestEffort
+        ));
+    }
+
+    // ------------------------------------------------------------------- process
+
+    #[test]
+    fn process_empty_strings_become_none() {
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            process: Some(ProtoProcessPolicy {
+                run_as_user: String::new(),
+                run_as_group: String::new(),
+            }),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::try_from(proto).unwrap();
+        assert_eq!(policy.process.run_as_user, None);
+        assert_eq!(policy.process.run_as_group, None);
+    }
+
+    #[test]
+    fn process_non_empty_strings_are_wrapped_in_some() {
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            process: Some(ProtoProcessPolicy {
+                run_as_user: "agent".to_string(),
+                run_as_group: "agents".to_string(),
+            }),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::try_from(proto).unwrap();
+        assert_eq!(policy.process.run_as_user.as_deref(), Some("agent"));
+        assert_eq!(policy.process.run_as_group.as_deref(), Some("agents"));
+    }
+
+    #[test]
+    fn absent_process_defaults_to_no_user_or_group() {
+        let policy = SandboxPolicy::try_from(empty_proto(1)).unwrap();
+        assert_eq!(policy.process.run_as_user, None);
+        assert_eq!(policy.process.run_as_group, None);
+    }
+}

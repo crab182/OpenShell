@@ -126,6 +126,42 @@ fn add_san(sans: &mut Vec<SanType>, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls_pki_types::{CertificateDer, ServerName, UnixTime, pem::PemObject};
+    use std::time::Duration;
+    use webpki::{EndEntityCert, KeyUsage, anchor_from_trusted_cert};
+
+    /// Signature algorithms `generate_pki` may use. `KeyPair::generate()` emits
+    /// ECDSA P-256/SHA-256 today; include the others so the suite stays valid if
+    /// the default ever changes.
+    const SIG_ALGS: &[&dyn rustls_pki_types::SignatureVerificationAlgorithm] = &[
+        webpki::ring::ECDSA_P256_SHA256,
+        webpki::ring::ECDSA_P384_SHA384,
+        webpki::ring::ED25519,
+    ];
+
+    /// Decode a single PEM certificate into owned DER bytes.
+    fn cert_der(pem: &str) -> CertificateDer<'static> {
+        CertificateDer::from_pem_slice(pem.as_bytes())
+            .expect("PEM did not contain a certificate")
+            .into_owned()
+    }
+
+    /// Verify that `leaf_pem` chains to the CA in `ca_pem` at the given time,
+    /// returning the underlying webpki result so callers can assert success or
+    /// inspect the rejection reason.
+    fn verify_chain(
+        leaf_pem: &str,
+        ca_pem: &str,
+        time: UnixTime,
+        usage: KeyUsage,
+    ) -> Result<(), webpki::Error> {
+        let ca = cert_der(ca_pem);
+        let anchor = anchor_from_trusted_cert(&ca).expect("CA is not a usable trust anchor");
+        let leaf = cert_der(leaf_pem);
+        let ee = EndEntityCert::try_from(&leaf).expect("leaf is not a valid certificate");
+        ee.verify_for_usage(SIG_ALGS, &[anchor], &[], time, usage, None, None)
+            .map(|_| ())
+    }
 
     #[test]
     fn generate_pki_produces_valid_pem() {
@@ -154,5 +190,191 @@ mod tests {
 
         // Should have all default SANs + 2 extras
         assert_eq!(sans.len(), DEFAULT_SERVER_SANS.len() + 2);
+    }
+
+    #[test]
+    fn build_server_sans_classifies_ip_and_dns() {
+        let sans = build_server_sans(&["203.0.113.7".to_string(), "remote.example".to_string()]);
+
+        // "127.0.0.1" (default) and the extra IP must be IpAddress SANs.
+        let ip_count = sans
+            .iter()
+            .filter(|s| matches!(s, SanType::IpAddress(_)))
+            .count();
+        let dns_count = sans
+            .iter()
+            .filter(|s| matches!(s, SanType::DnsName(_)))
+            .count();
+        assert_eq!(
+            ip_count, 2,
+            "expected the default 127.0.0.1 plus the extra IP"
+        );
+        assert_eq!(
+            dns_count,
+            sans.len() - 2,
+            "remaining SANs should be DNS names"
+        );
+    }
+
+    #[test]
+    fn add_san_skips_unencodable_values() {
+        // A non-ASCII hostname is neither a valid IP nor a valid Ia5String, so it
+        // is silently dropped rather than panicking.
+        let mut sans = Vec::new();
+        add_san(&mut sans, "héllo.example");
+        assert!(sans.is_empty());
+    }
+
+    #[test]
+    fn server_cert_chains_to_issuing_ca() {
+        let bundle = generate_pki(&[]).expect("generate_pki failed");
+        verify_chain(
+            &bundle.server_cert_pem,
+            &bundle.ca_cert_pem,
+            UnixTime::now(),
+            KeyUsage::server_auth(),
+        )
+        .expect("server certificate should chain to its issuing CA");
+    }
+
+    #[test]
+    fn client_cert_chains_to_issuing_ca() {
+        let bundle = generate_pki(&[]).expect("generate_pki failed");
+        verify_chain(
+            &bundle.client_cert_pem,
+            &bundle.ca_cert_pem,
+            UnixTime::now(),
+            KeyUsage::client_auth(),
+        )
+        .expect("client certificate should chain to its issuing CA");
+    }
+
+    #[test]
+    fn cert_signed_by_wrong_ca_is_rejected() {
+        // Two independent PKI bundles: each CA must reject the other's leaf certs.
+        let a = generate_pki(&[]).expect("generate_pki failed");
+        let b = generate_pki(&[]).expect("generate_pki failed");
+
+        // Both CAs share the "openshell-ca" subject DN, so webpki may locate the
+        // wrong anchor by name and then fail at signature verification
+        // (`InvalidSignatureForPublicKey`) rather than reporting `UnknownIssuer`.
+        // Either way the chain must be rejected; assert on the rejecting variants.
+        let is_rejection = |e: &webpki::Error| {
+            matches!(
+                e,
+                webpki::Error::UnknownIssuer | webpki::Error::InvalidSignatureForPublicKey
+            )
+        };
+
+        let err = verify_chain(
+            &a.server_cert_pem,
+            &b.ca_cert_pem,
+            UnixTime::now(),
+            KeyUsage::server_auth(),
+        )
+        .expect_err("server cert must not validate against an unrelated CA");
+        assert!(
+            is_rejection(&err),
+            "unexpected error for wrong-CA server cert: {err:?}"
+        );
+
+        let err = verify_chain(
+            &a.client_cert_pem,
+            &b.ca_cert_pem,
+            UnixTime::now(),
+            KeyUsage::client_auth(),
+        )
+        .expect_err("client cert must not validate against an unrelated CA");
+        assert!(
+            is_rejection(&err),
+            "unexpected error for wrong-CA client cert: {err:?}"
+        );
+
+        // Sanity check: each leaf still validates against its *own* CA, proving the
+        // rejection above is due to the mismatched issuer and not a broken chain.
+        verify_chain(
+            &a.server_cert_pem,
+            &a.ca_cert_pem,
+            UnixTime::now(),
+            KeyUsage::server_auth(),
+        )
+        .expect("server cert should validate against its own CA");
+    }
+
+    #[test]
+    fn server_cert_valid_for_default_and_extra_sans() {
+        let extra = "node-1.remote.example";
+        let bundle = generate_pki(&[extra.to_string()]).expect("generate_pki failed");
+        let leaf = cert_der(&bundle.server_cert_pem);
+        let ee = EndEntityCert::try_from(&leaf).expect("leaf is not a valid certificate");
+
+        // Default DNS, default IP, and the caller-supplied extra SAN must all match.
+        for name in ["localhost", "host.docker.internal", "127.0.0.1", extra] {
+            let server_name = ServerName::try_from(name).expect("test name should parse");
+            ee.verify_is_valid_for_subject_name(&server_name)
+                .unwrap_or_else(|e| panic!("cert should be valid for SAN {name}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn server_cert_rejects_name_not_in_sans() {
+        let bundle = generate_pki(&[]).expect("generate_pki failed");
+        let leaf = cert_der(&bundle.server_cert_pem);
+        let ee = EndEntityCert::try_from(&leaf).expect("leaf is not a valid certificate");
+
+        let server_name =
+            ServerName::try_from("not-a-listed-host.example").expect("test name should parse");
+        let err = ee
+            .verify_is_valid_for_subject_name(&server_name)
+            .expect_err("cert must not be valid for a name absent from its SANs");
+        assert!(matches!(err, webpki::Error::CertNotValidForName(_)));
+    }
+
+    #[test]
+    fn extra_ip_san_is_present_on_server_cert() {
+        let bundle = generate_pki(&["198.51.100.42".to_string()]).expect("generate_pki failed");
+        let leaf = cert_der(&bundle.server_cert_pem);
+        let ee = EndEntityCert::try_from(&leaf).expect("leaf is not a valid certificate");
+
+        let ip = ServerName::try_from("198.51.100.42").expect("IP should parse");
+        ee.verify_is_valid_for_subject_name(&ip)
+            .expect("extra IP SAN should be present on the server certificate");
+    }
+
+    #[test]
+    fn cert_validity_window_covers_now_and_future_but_not_before_start() {
+        let bundle = generate_pki(&[]).expect("generate_pki failed");
+
+        // rcgen's default validity is 1975-01-01 .. 4096-01-01, so "now" and a
+        // far-future timestamp both fall inside the window.
+        verify_chain(
+            &bundle.server_cert_pem,
+            &bundle.ca_cert_pem,
+            UnixTime::now(),
+            KeyUsage::server_auth(),
+        )
+        .expect("cert should be valid now");
+
+        // ~year 3000 (well before not_after 4096, comfortably after not_before).
+        let far_future = UnixTime::since_unix_epoch(Duration::from_secs(32_503_680_000));
+        verify_chain(
+            &bundle.server_cert_pem,
+            &bundle.ca_cert_pem,
+            far_future,
+            KeyUsage::server_auth(),
+        )
+        .expect("cert should still be valid far in the future, before not_after");
+
+        // 100 seconds after the Unix epoch (1970) precedes not_before (1975),
+        // so validation must report the cert as not yet valid.
+        let before_not_before = UnixTime::since_unix_epoch(Duration::from_secs(100));
+        let err = verify_chain(
+            &bundle.server_cert_pem,
+            &bundle.ca_cert_pem,
+            before_not_before,
+            KeyUsage::server_auth(),
+        )
+        .expect_err("cert must not validate before its not_before");
+        assert!(matches!(err, webpki::Error::CertNotValidYet { .. }));
     }
 }
