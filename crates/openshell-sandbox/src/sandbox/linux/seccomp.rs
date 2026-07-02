@@ -46,7 +46,7 @@ pub fn apply(policy: &SandboxPolicy) -> Result<()> {
     Ok(())
 }
 
-fn build_filter(allow_inet: bool) -> Result<seccompiler::BpfProgram> {
+fn build_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
     // --- Socket domain blocks ---
@@ -106,6 +106,16 @@ fn build_filter(allow_inet: bool) -> Result<seccompiler::BpfProgram> {
     .into_diagnostic()?;
     let rule = SeccompRule::new(vec![condition]).into_diagnostic()?;
     rules.entry(libc::SYS_seccomp).or_default().push(rule);
+
+    Ok(rules)
+}
+
+/// Compile the seccomp rule set for the given network mode into an installable
+/// BPF program. The rule assembly lives in [`build_rules`] so it can be unit
+/// tested directly — a compiled `BpfProgram` is opaque bytecode and cannot be
+/// inspected for which syscalls it blocks.
+fn build_filter(allow_inet: bool) -> Result<seccompiler::BpfProgram> {
+    let rules = build_rules(allow_inet)?;
 
     let arch = std::env::consts::ARCH
         .try_into()
@@ -189,69 +199,38 @@ mod tests {
 
     #[test]
     fn unconditional_blocks_present_in_filter() {
-        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-
-        // Simulate what build_filter does for unconditional blocks
-        rules.entry(libc::SYS_memfd_create).or_default();
-        rules.entry(libc::SYS_ptrace).or_default();
-        rules.entry(libc::SYS_bpf).or_default();
-        rules.entry(libc::SYS_process_vm_readv).or_default();
-        rules.entry(libc::SYS_io_uring_setup).or_default();
-        rules.entry(libc::SYS_mount).or_default();
-
-        // Unconditional blocks have an empty Vec (no conditions = always match)
-        for syscall in [
-            libc::SYS_memfd_create,
-            libc::SYS_ptrace,
-            libc::SYS_bpf,
-            libc::SYS_process_vm_readv,
-            libc::SYS_io_uring_setup,
-            libc::SYS_mount,
-        ] {
-            assert!(
-                rules.contains_key(&syscall),
-                "syscall {syscall} should be in the rules map"
-            );
-            assert!(
-                rules[&syscall].is_empty(),
-                "syscall {syscall} should have empty rules (unconditional block)"
-            );
+        // Assert against the REAL rule map build_filter compiles, in both modes,
+        // so deleting any `rules.entry(SYS_x).or_default()` from build_rules
+        // fails this test (rather than passing against a test-local copy).
+        for allow_inet in [true, false] {
+            let rules = build_rules(allow_inet).expect("build_rules must succeed");
+            for syscall in UNCONDITIONAL_BLOCKS {
+                assert!(
+                    rules.contains_key(&syscall),
+                    "syscall {syscall} must be blocked (allow_inet={allow_inet})"
+                );
+                assert!(
+                    rules[&syscall].is_empty(),
+                    "syscall {syscall} must be an unconditional (empty-rule) block"
+                );
+            }
         }
     }
 
     #[test]
     fn conditional_blocks_have_rules() {
-        // Build a real filter and verify the conditional syscalls have rule entries
-        // (non-empty Vec means conditional match)
-        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-
-        add_masked_arg_rule(
-            &mut rules,
-            libc::SYS_execveat,
-            4,
-            libc::AT_EMPTY_PATH as u64,
-        )
-        .unwrap();
-        add_masked_arg_rule(&mut rules, libc::SYS_unshare, 0, libc::CLONE_NEWUSER as u64).unwrap();
-
-        let condition = SeccompCondition::new(
-            0,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            SECCOMP_SET_MODE_FILTER,
-        )
-        .unwrap();
-        let rule = SeccompRule::new(vec![condition]).unwrap();
-        rules.entry(libc::SYS_seccomp).or_default().push(rule);
-
+        // The conditional syscalls must carry a non-empty rule vec in the real
+        // map (empty would mean an *unconditional* block, non-present would mean
+        // no block at all). Asserted against build_rules, not a reconstruction.
+        let rules = build_rules(false).expect("build_rules must succeed");
         for syscall in [libc::SYS_execveat, libc::SYS_unshare, libc::SYS_seccomp] {
             assert!(
                 rules.contains_key(&syscall),
-                "syscall {syscall} should be in the rules map"
+                "syscall {syscall} must be present in the rule map"
             );
             assert!(
                 !rules[&syscall].is_empty(),
-                "syscall {syscall} should have conditional rules"
+                "syscall {syscall} must carry a conditional rule"
             );
         }
     }
@@ -267,22 +246,11 @@ mod tests {
         libc::SYS_mount,
     ];
 
-    /// Mirror of the socket-domain selection logic in `build_filter`, used to
-    /// drive the real `add_socket_domain_rule` helper from tests. Returns the
-    /// populated rules map so the resulting `SYS_socket` rules can be inspected.
+    /// The REAL production rule map for a given network mode. Tests assert
+    /// against this (not a reconstruction of the selection logic) so a change
+    /// to `build_rules` — e.g. dropping a blocked socket domain — is caught.
     fn socket_rules_for(allow_inet: bool) -> BTreeMap<i64, Vec<SeccompRule>> {
-        let mut blocked_domains = vec![libc::AF_PACKET, libc::AF_BLUETOOTH, libc::AF_VSOCK];
-        if !allow_inet {
-            blocked_domains.push(libc::AF_INET);
-            blocked_domains.push(libc::AF_INET6);
-            blocked_domains.push(libc::AF_NETLINK);
-        }
-
-        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-        for domain in blocked_domains {
-            add_socket_domain_rule(&mut rules, domain).unwrap();
-        }
-        rules
+        build_rules(allow_inet).expect("build_rules must succeed")
     }
 
     /// Independently rebuild the rule that `add_socket_domain_rule` is expected
@@ -437,15 +405,9 @@ mod tests {
     #[test]
     fn unconditional_blocks_identical_across_modes() {
         // The unconditional syscall blocks are network-mode independent: they must
-        // be present, and empty (always-match), in both proxy and block mode.
-        // We reconstruct the same map build_filter assembles, exercising the real
-        // socket/masked helpers, then assert the unconditional set is invariant.
+        // be present, and empty (always-match), in the real map for both modes.
         for allow_inet in [true, false] {
-            let mut rules = socket_rules_for(allow_inet);
-            for syscall in UNCONDITIONAL_BLOCKS {
-                rules.entry(syscall).or_default();
-            }
-
+            let rules = socket_rules_for(allow_inet);
             for syscall in UNCONDITIONAL_BLOCKS {
                 assert!(
                     rules.contains_key(&syscall),

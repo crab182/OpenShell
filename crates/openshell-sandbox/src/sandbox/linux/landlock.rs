@@ -13,17 +13,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
-    let read_only = policy.filesystem.read_only.clone();
-    let mut read_write = policy.filesystem.read_write.clone();
-
-    if policy.filesystem.include_workdir
-        && let Some(dir) = workdir
-    {
-        let workdir_path = PathBuf::from(dir);
-        if !read_write.contains(&workdir_path) {
-            read_write.push(workdir_path);
-        }
-    }
+    let (read_only, read_write) = resolve_paths(policy, workdir);
 
     if read_only.is_empty() && read_write.is_empty() {
         return Ok(());
@@ -92,6 +82,34 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
         Ok(())
     })();
 
+    finalize_result(result, compatibility)
+}
+
+/// Resolve the effective read-only / read-write path lists for `policy`, folding
+/// `workdir` into the read-write set when requested (deduped). Pure, so the
+/// path-selection logic can be unit tested without the Landlock LSM.
+fn resolve_paths(policy: &SandboxPolicy, workdir: Option<&str>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let read_only = policy.filesystem.read_only.clone();
+    let mut read_write = policy.filesystem.read_write.clone();
+
+    if policy.filesystem.include_workdir
+        && let Some(dir) = workdir
+    {
+        let workdir_path = PathBuf::from(dir);
+        if !read_write.contains(&workdir_path) {
+            read_write.push(workdir_path);
+        }
+    }
+
+    (read_only, read_write)
+}
+
+/// Apply the compatibility-mode outcome to the ruleset build `result`: a
+/// hard-requirement propagates any error, while best-effort downgrades an error
+/// to `Ok` and runs WITHOUT filesystem restrictions (logged loudly). This is the
+/// central security tradeoff of the module, extracted so it can be tested
+/// without installing a real ruleset.
+fn finalize_result(result: Result<()>, compatibility: &LandlockCompatibility) -> Result<()> {
     if let Err(err) = result {
         if matches!(compatibility, LandlockCompatibility::BestEffort) {
             warn!(
@@ -265,6 +283,87 @@ mod tests {
     fn classify_not_a_directory() {
         let err = std::io::Error::from_raw_os_error(libc::ENOTDIR);
         assert_eq!(classify_io_error(&err), "path component is not a directory");
+    }
+
+    fn fs_policy(
+        read_only: Vec<PathBuf>,
+        read_write: Vec<PathBuf>,
+        include_workdir: bool,
+    ) -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: crate::policy::FilesystemPolicy {
+                read_only,
+                read_write,
+                include_workdir,
+            },
+            network: crate::policy::NetworkPolicy::default(),
+            landlock: crate::policy::LandlockPolicy::default(),
+            process: crate::policy::ProcessPolicy::default(),
+        }
+    }
+
+    #[test]
+    fn resolve_paths_appends_workdir_as_read_write() {
+        let (ro, rw) = resolve_paths(&fs_policy(vec![], vec![], true), Some("/work"));
+        assert!(ro.is_empty());
+        assert_eq!(rw, vec![PathBuf::from("/work")]);
+    }
+
+    #[test]
+    fn resolve_paths_does_not_duplicate_existing_workdir() {
+        let policy = fs_policy(vec![], vec![PathBuf::from("/work")], true);
+        let (_, rw) = resolve_paths(&policy, Some("/work"));
+        assert_eq!(
+            rw,
+            vec![PathBuf::from("/work")],
+            "an already-present workdir must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn resolve_paths_skips_workdir_when_not_included() {
+        let (ro, rw) = resolve_paths(&fs_policy(vec![], vec![], false), Some("/work"));
+        assert!(
+            ro.is_empty() && rw.is_empty(),
+            "workdir must be ignored when include_workdir is false"
+        );
+    }
+
+    #[test]
+    fn resolve_paths_empty_policy_stays_empty() {
+        // This is the precondition for apply()'s early Ok return.
+        let (ro, rw) = resolve_paths(&fs_policy(vec![], vec![], true), None);
+        assert!(ro.is_empty() && rw.is_empty());
+    }
+
+    #[test]
+    fn finalize_best_effort_downgrades_error_to_ok() {
+        // The central tradeoff: a failed ruleset build in best-effort mode runs
+        // the process WITHOUT a filesystem sandbox instead of aborting.
+        let out = finalize_result(
+            Err(miette::miette!("ruleset failed")),
+            &LandlockCompatibility::BestEffort,
+        );
+        assert!(
+            out.is_ok(),
+            "best-effort must swallow the error and continue"
+        );
+    }
+
+    #[test]
+    fn finalize_hard_requirement_propagates_error() {
+        let out = finalize_result(
+            Err(miette::miette!("ruleset failed")),
+            &LandlockCompatibility::HardRequirement,
+        );
+        assert!(out.is_err(), "hard-requirement must propagate the error");
+    }
+
+    #[test]
+    fn finalize_success_passes_through_in_both_modes() {
+        assert!(finalize_result(Ok(()), &LandlockCompatibility::BestEffort).is_ok());
+        assert!(finalize_result(Ok(()), &LandlockCompatibility::HardRequirement).is_ok());
     }
 
     #[test]

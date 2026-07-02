@@ -234,14 +234,37 @@ mod tests {
 
         let policy = SandboxPolicy::try_from(proto).unwrap();
 
-        // Redundant separators, trailing slashes, and `.` components collapse so
-        // that allow-list matching can't be defeated by path aliasing.
+        // Redundant separators, trailing slashes, and `.` components collapse.
+        // (This is lexical tidy-up only; see the `..` test below for what it does
+        // NOT do — traversal is guarded by a separate validation pass, not here.)
         assert_eq!(
             policy.filesystem.read_only,
             vec![PathBuf::from("/data/foo"), PathBuf::from("/a/b")],
         );
         assert_eq!(policy.filesystem.read_write, vec![PathBuf::from("/work")]);
         assert!(!policy.filesystem.include_workdir);
+    }
+
+    #[test]
+    fn filesystem_normalization_preserves_parent_dir_components() {
+        // `openshell_policy::normalize_path` intentionally does NOT collapse `..`
+        // ("validation catches it separately"), and this conversion does not run
+        // that validation. Pin the real behaviour so the normalization above is
+        // not misread as traversal defense: a `..` survives verbatim.
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFilesystemPolicy {
+                read_only: vec!["/work/../etc".to_string()],
+                read_write: Vec::new(),
+                include_workdir: false,
+            }),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::try_from(proto).unwrap();
+        assert_eq!(
+            policy.filesystem.read_only,
+            vec![PathBuf::from("/work/../etc")],
+        );
     }
 
     // ------------------------------------------------------------------ landlock

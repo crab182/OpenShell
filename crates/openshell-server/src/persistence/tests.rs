@@ -23,7 +23,7 @@ async fn sqlite_put_get_round_trip() {
 }
 
 #[tokio::test]
-async fn sqlite_updates_timestamp() {
+async fn sqlite_put_conflict_overwrites_payload_but_not_name_or_created_at() {
     let store = Store::connect("sqlite::memory:?cache=shared")
         .await
         .unwrap();
@@ -32,17 +32,60 @@ async fn sqlite_updates_timestamp() {
         .put("sandbox", "abc", "my-sandbox", b"payload")
         .await
         .unwrap();
-
     let first = store.get("sandbox", "abc").await.unwrap().unwrap();
 
+    // Re-put the same id with a DIFFERENT name and payload. The previous version
+    // of this test asserted only `updated_at_ms >= first.updated_at_ms`, which is
+    // true even if the update did nothing (both puts land in the same
+    // millisecond). These assertions instead pin the real ON CONFLICT semantics.
     store
-        .put("sandbox", "abc", "my-sandbox", b"payload2")
+        .put("sandbox", "abc", "renamed-sandbox", b"payload2")
+        .await
+        .unwrap();
+    let second = store.get("sandbox", "abc").await.unwrap().unwrap();
+
+    // ON CONFLICT updates payload + updated_at_ms only.
+    assert_eq!(second.payload, b"payload2", "payload must be overwritten");
+    assert_eq!(
+        second.name, "my-sandbox",
+        "name must NOT change on conflict (it is not in the ON CONFLICT SET list)"
+    );
+    assert_eq!(
+        second.created_at_ms, first.created_at_ms,
+        "created_at must be preserved across an update"
+    );
+    assert!(
+        second.updated_at_ms >= second.created_at_ms,
+        "updated_at must be at or after created_at"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_duplicate_policy_version_is_rejected() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
         .await
         .unwrap();
 
-    let second = store.get("sandbox", "abc").await.unwrap().unwrap();
-    assert!(second.updated_at_ms >= first.updated_at_ms);
-    assert_eq!(second.payload, b"payload2");
+    store
+        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .await
+        .unwrap();
+
+    // A second revision at the same (sandbox_id, version) — even with a fresh
+    // row id — violates UNIQUE(sandbox_id, version) and must be rejected, so a
+    // policy revision can never be silently duplicated or overwritten.
+    let dup = store
+        .put_policy_revision("p2", "sandbox-1", 1, b"v1-tampered", "h1b")
+        .await;
+    assert!(
+        dup.is_err(),
+        "duplicate (sandbox_id, version) must be rejected, got {dup:?}"
+    );
+
+    // The original revision is untouched.
+    let latest = store.get_latest_policy("sandbox-1").await.unwrap().unwrap();
+    assert_eq!(latest.version, 1);
+    assert_eq!(latest.policy_hash, "h1");
 }
 
 #[tokio::test]

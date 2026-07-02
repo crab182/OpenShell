@@ -190,6 +190,19 @@ mod tests {
 
         // Should have all default SANs + 2 extras
         assert_eq!(sans.len(), DEFAULT_SERVER_SANS.len() + 2);
+        // Length alone passes even if a default SAN were dropped while an extra
+        // was duplicated — assert the specific extras actually landed, correctly
+        // classified as IP vs DNS.
+        assert!(
+            sans.contains(&SanType::IpAddress("192.168.1.100".parse().unwrap())),
+            "the extra IP must be present as an IpAddress SAN"
+        );
+        assert!(
+            sans.contains(&SanType::DnsName(
+                Ia5String::try_from("remote.host").unwrap()
+            )),
+            "the extra hostname must be present as a DnsName SAN"
+        );
     }
 
     #[test]
@@ -247,6 +260,28 @@ mod tests {
             KeyUsage::client_auth(),
         )
         .expect("client certificate should chain to its issuing CA");
+    }
+
+    #[test]
+    fn leaf_certs_are_currently_usage_interchangeable_no_eku() {
+        // Documents a known limitation, as a tripwire. `generate_pki` sets no
+        // ExtendedKeyUsage on the leaf certs, so webpki treats each as valid for
+        // ANY usage: a CLIENT cert currently satisfies `server_auth` (and vice
+        // versa), i.e. the mTLS certs are role-interchangeable. If EKUs are later
+        // added (recommended, to enforce client/server separation), this
+        // assertion will start failing — at which point flip it to
+        // `expect_err(...)` asserting the wrong-usage cert is rejected.
+        let bundle = generate_pki(&[]).expect("generate_pki failed");
+        verify_chain(
+            &bundle.client_cert_pem,
+            &bundle.ca_cert_pem,
+            UnixTime::now(),
+            KeyUsage::server_auth(),
+        )
+        .expect(
+            "no-EKU leaf validates for server_auth today; if this now fails, \
+             EKUs were added — update this test to assert client/server separation",
+        );
     }
 
     #[test]
