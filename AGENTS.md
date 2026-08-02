@@ -110,7 +110,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 
 ## Keeping This File Current
 
-- When the user provides a correction in any session (task, Cowork thread, or code session), record the corrected guidance in this file in the same session so future sessions inherit it.
+- When the user provides a correction in any session (task, Cowork thread, or code session), record the corrected guidance in this file in the same session so future sessions inherit it. Record only durable, project-wide guidance — never session-specific details or sensitive information.
 
 ## Security
 
