@@ -108,6 +108,10 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 - Follow the style guide in [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): active voice, no unnecessary bold, no em dash overuse, no filler introductions.
 - Use the `update-docs` skill to scan recent commits and draft doc updates.
 
+## Keeping This File Current
+
+- When the user provides a correction in any session (task, Cowork thread, or code session), record the corrected guidance in this file in the same session so future sessions inherit it. Record only durable, project-wide guidance — never session-specific details or sensitive information.
+
 ## Security
 
 - Never commit secrets, API keys, or credentials. If a file looks like it contains secrets (`.env`, `credentials.json`, etc.), do not stage it.
