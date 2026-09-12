@@ -25,26 +25,6 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 - **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
   - CLI manages the sandbox lifecycle; policy generation authors the YAML constraints.
 
-## Architecture Overview
-
-| Path | Components | Purpose |
-|------|-----------|---------|
-| `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
-| `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
-| `crates/openshell-sandbox/` | Sandbox runtime | Container supervision, policy-enforced egress routing |
-| `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
-| `crates/openshell-router/` | Privacy router | Privacy-aware LLM routing |
-| `crates/openshell-bootstrap/` | Cluster bootstrap | K3s cluster setup, image loading, mTLS PKI |
-| `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
-| `crates/openshell-providers/` | Provider management | Credential provider backends |
-| `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
-| `python/openshell/` | Python SDK | Python bindings and CLI packaging |
-| `proto/` | Protobuf definitions | gRPC service contracts |
-| `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
-| `.agents/skills/` | Agent skills | Workflow automation for development |
-| `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer, doc writer) |
-| `architecture/` | Architecture docs | Design decisions and component documentation |
-
 ## Vouch System
 
 - First-time external contributors must be vouched before their PRs are accepted. The `vouch-check` workflow auto-closes PRs from unvouched users.
